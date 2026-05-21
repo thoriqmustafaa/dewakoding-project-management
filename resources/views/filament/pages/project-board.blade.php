@@ -923,7 +923,7 @@
                                         @endif
 
                                         <a
-                                            href="{{ \App\Filament\Resources\Tickets\TicketResource::getUrl('view', ['record' => $ticket->id]) }}"
+                                            href="{{ $this->ticketViewUrl($ticket->id) }}"
                                             target="_blank"
                                             rel="noopener noreferrer"
                                             onclick="

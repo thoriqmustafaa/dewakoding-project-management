@@ -17,6 +17,7 @@ use Filament\Schemas\Components\Grid;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
 use Illuminate\Support\HtmlString;
+use Illuminate\Support\Str;
 
 class ViewTicket extends ViewRecord
 {
@@ -40,7 +41,7 @@ class ViewTicket extends ViewRecord
             ->fillForm(function (array $arguments): array {
                 $comment = TicketComment::find($arguments['commentId']);
 
-                if (!$comment) {
+                if (! $comment) {
                     return [];
                 }
 
@@ -52,7 +53,7 @@ class ViewTicket extends ViewRecord
             ->action(function (array $data): void {
                 $comment = TicketComment::find($data['comment_id']);
 
-                if (!$comment) {
+                if (! $comment) {
                     Notification::make()
                         ->title('Comment not found')
                         ->danger()
@@ -61,7 +62,7 @@ class ViewTicket extends ViewRecord
                     return;
                 }
 
-                if ($comment->user_id !== auth()->id() && !auth()->user()->hasRole(['super_admin'])) {
+                if ($comment->user_id !== auth()->id() && ! auth()->user()->hasRole(['super_admin'])) {
                     Notification::make()
                         ->title('You do not have permission to edit this comment')
                         ->danger()
@@ -98,7 +99,7 @@ class ViewTicket extends ViewRecord
             ->action(function (array $arguments): void {
                 $comment = TicketComment::find($arguments['commentId']);
 
-                if (!$comment) {
+                if (! $comment) {
                     Notification::make()
                         ->title('Comment not found')
                         ->danger()
@@ -107,7 +108,7 @@ class ViewTicket extends ViewRecord
                     return;
                 }
 
-                if ($comment->user_id !== auth()->id() && !auth()->user()->hasRole(['super_admin'])) {
+                if ($comment->user_id !== auth()->id() && ! auth()->user()->hasRole(['super_admin'])) {
                     Notification::make()
                         ->title('You do not have permission to delete this comment')
                         ->danger()
@@ -134,8 +135,9 @@ class ViewTicket extends ViewRecord
 
         return preg_replace_callback($pattern, function ($matches) {
             $videoUrl = $matches[1];
+
             return '<video controls class="max-w-full rounded-lg my-2" style="max-height: 400px;">
-                    <source src="' . $videoUrl . '" type="video/' . pathinfo($videoUrl, PATHINFO_EXTENSION) . '">
+                    <source src="'.$videoUrl.'" type="video/'.pathinfo($videoUrl, PATHINFO_EXTENSION).'">
                     Your browser does not support the video tag.
                 </video>';
         }, $html);
@@ -153,11 +155,73 @@ class ViewTicket extends ViewRecord
                         || $ticket->assignees()->where('users.id', auth()->id())->exists();
                 }),
 
+            Action::make('copy_url')
+                ->label('Copy URL')
+                ->icon('heroicon-o-clipboard-document')
+                ->color('gray')
+                ->alpineClickHandler(fn () => $this->copyTicketUrlScript()),
+
             Action::make('back')
                 ->label('Back to Board')
                 ->color('gray')
-                ->url(fn() => ProjectBoard::getUrl(['project_id' => $this->record->project_id])),
+                ->url(fn () => $this->getBackToBoardUrl()),
         ];
+    }
+
+    private function getBackToBoardUrl(): string
+    {
+        $from = request()->query('from');
+
+        if (is_string($from)) {
+            if ($this->isProjectBoardRouteParameter($from)) {
+                return ProjectBoard::getUrl(['project_id' => $from]);
+            }
+
+            if ($this->isProjectBoardUrl($from)) {
+                return $from;
+            }
+        }
+
+        return ProjectBoard::getUrl(['project_id' => $this->record->project_id]);
+    }
+
+    private function getTicketUrl(): string
+    {
+        return TicketResource::getUrl('view', ['record' => $this->record]);
+    }
+
+    private function copyTicketUrlScript(): string
+    {
+        $url = str_replace(['\\', "'"], ['\\\\', "\\'"], $this->getTicketUrl());
+
+        return "(() => { const url = '{$url}'; const notify = (copied) => window.FilamentNotification && new FilamentNotification().title(copied ? 'Ticket URL copied' : 'Unable to copy ticket URL')[copied ? 'success' : 'danger']().send(); const fallback = () => { const textarea = document.createElement('textarea'); textarea.value = url; textarea.setAttribute('readonly', ''); textarea.style.position = 'fixed'; textarea.style.top = '-1000px'; textarea.style.left = '-1000px'; document.body.appendChild(textarea); textarea.select(); const copied = document.execCommand('copy'); textarea.remove(); notify(copied); }; if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(url).then(() => notify(true)).catch(fallback); } else { fallback(); } })()";
+    }
+
+    private function isProjectBoardRouteParameter(string $from): bool
+    {
+        return $from === 'all-project'
+            || ctype_digit($from)
+            || preg_match('/^selected-projects-\d+(?:[,-]\d+)*$/', $from) === 1;
+    }
+
+    private function isProjectBoardUrl(string $url): bool
+    {
+        $boardUrl = ProjectBoard::getUrl();
+        $boardPath = parse_url($boardUrl, PHP_URL_PATH);
+        $fromPath = parse_url($url, PHP_URL_PATH);
+
+        if (! is_string($boardPath) || ! is_string($fromPath)) {
+            return false;
+        }
+
+        $fromHost = parse_url($url, PHP_URL_HOST);
+        $boardHost = parse_url($boardUrl, PHP_URL_HOST);
+
+        if (is_string($fromHost) && $fromHost !== '' && $fromHost !== request()->getHost() && $fromHost !== $boardHost) {
+            return false;
+        }
+
+        return $fromPath === $boardPath || Str::startsWith($fromPath, rtrim($boardPath, '/').'/');
     }
 
     public function infolist(Schema $schema): Schema
@@ -219,7 +283,7 @@ class ViewTicket extends ViewRecord
                                     ->label('Due Date')
                                     ->date('d M Y')
                                     ->icon('heroicon-o-calendar')
-                                    ->color(fn($record) => $record->due_date && $record->due_date->isPast() ? 'danger' : 'success'),
+                                    ->color(fn ($record) => $record->due_date && $record->due_date->isPast() ? 'danger' : 'success'),
                             ]),
                     ]),
 

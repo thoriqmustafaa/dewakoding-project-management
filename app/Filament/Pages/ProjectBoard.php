@@ -5,15 +5,22 @@ namespace App\Filament\Pages;
 use App\Exports\TicketsExport;
 use App\Filament\Actions\ExportTicketsAction;
 use App\Filament\Resources\Tickets\TicketResource;
+use App\Models\Epic;
 use App\Models\Project;
 use App\Models\Ticket;
+use App\Models\TicketPriority;
 use App\Models\TicketStatus;
 use App\Models\User;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Forms\Components\CheckboxList;
+use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\RichEditor;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\TextInput;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
+use Filament\Schemas\Schema;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
@@ -410,6 +417,11 @@ class ProjectBoard extends Page
     {
         $this->loadTicketStatuses();
         $this->dispatch('ticket-updated');
+
+        Notification::make()
+            ->title('Board Refreshed')
+            ->success()
+            ->send();
     }
 
     public function showTicketDetails(int $ticketId): void
@@ -425,7 +437,7 @@ class ProjectBoard extends Page
             return;
         }
 
-        $url = TicketResource::getUrl('view', ['record' => $ticketId]);
+        $url = $this->ticketViewUrl($ticketId);
         $this->js("window.open('{$url}', '_blank')");
     }
 
@@ -458,12 +470,25 @@ class ProjectBoard extends Page
                 ->name('ticket_on_board')
                 ->label('New Ticket')
                 ->icon('heroicon-m-plus')
-                ->visible(fn () => $this->selectedProject !== null && auth()->user()->can('create_ticket'))
-                ->schema(fn ($schema) => TicketResource::form($schema)
-                    ->columns(3)
-                )
+                ->visible(fn () => ! $this->isProjectIndex() && auth()->user()->can('create_ticket'))
+                ->schema(function ($schema) {
+                    // When in global board mode, we need a project selector first
+                    if ($this->isGlobalBoard()) {
+                        return $this->globalBoardTicketForm($schema);
+                    }
+
+                    return TicketResource::form($schema)->columns(3);
+                })
                 ->model(Ticket::class)
                 ->fillForm(function () {
+                    if ($this->isGlobalBoard()) {
+                        return [
+                            'project_id' => null,
+                            'ticket_status_id' => null,
+                            'assignees' => [],
+                        ];
+                    }
+
                     $assignees = [];
 
                     // Auto-assign current user if they're a project member
@@ -477,22 +502,36 @@ class ProjectBoard extends Page
                         'ticket_status_id' => $this->ticketStatuses?->first()?->id,
                         'assignees' => $assignees,
                     ];
-
                 })
                 ->action(function (array $data, $schema) {
                     $data['created_by'] = auth()->id();
 
-                    $model = $schema->getModel();
+                    // Extract assignees — not a DB column, handle separately
+                    $assigneeIds = $data['assignees'] ?? [];
+                    unset($data['assignees']);
 
+                    $model = $schema->getModel();
                     $record = $model::create($data);
 
-                    $schema->model($record)->saveRelationships();
+                    // Sync assignees to pivot table
+                    if (! empty($assigneeIds)) {
+                        $record->assignees()->sync($assigneeIds);
+                    } elseif (! empty($data['project_id'])) {
+                        // Auto-assign current user if they're a project member
+                        $project = Project::find($data['project_id']);
+                        if ($project && $project->members()->where('users.id', auth()->id())->exists()) {
+                            $record->assignees()->sync([auth()->id()]);
+                        }
+                    }
 
                     Notification::make()
                         ->title('Ticket Created')
                         ->body('The ticket has been created successfully.')
                         ->success()
                         ->send();
+
+                    $this->loadTicketStatuses();
+                    $this->dispatch('ticket-updated');
                 }),
 
             Action::make('refresh_board')
@@ -764,6 +803,30 @@ class ProjectBoard extends Page
     public function isProjectIndex(): bool
     {
         return $this->boardMode === self::MODE_INDEX;
+    }
+
+    public function ticketViewUrl(int $ticketId): string
+    {
+        $parameters = ['record' => $ticketId];
+
+        if ($from = $this->currentBoardRouteParameter()) {
+            $parameters['from'] = $from;
+        }
+
+        return TicketResource::getUrl('view', $parameters);
+    }
+
+    private function currentBoardRouteParameter(): ?string
+    {
+        if ($this->isGlobalBoard()) {
+            return str_replace(',', '-', $this->globalRouteParameter());
+        }
+
+        if ($this->selectedProjectId) {
+            return (string) $this->selectedProjectId;
+        }
+
+        return null;
     }
 
     public function boardTitle(): string
@@ -1173,5 +1236,126 @@ class ProjectBoard extends Page
     private function getColumnLimit(int|string $columnId): int
     {
         return $this->columnLimits[(string) $columnId] ?? self::DEFAULT_COLUMN_LIMIT;
+    }
+
+    private function globalBoardTicketForm(Schema $schema): Schema
+    {
+        // Resolve which project IDs are visible based on current filter
+        $visibleProjectIds = $this->visibleGlobalProjectIds();
+
+        $projectOptions = $this->projects
+            ->when(
+                ! empty($visibleProjectIds),
+                fn (Collection $projects) => $projects->whereIn('id', $visibleProjectIds)
+            )
+            ->pluck('name', 'id')
+            ->toArray();
+
+        return $schema
+            ->columns(3)
+            ->components([
+                Select::make('project_id')
+                    ->label('Project')
+                    ->options($projectOptions)
+                    ->required()
+                    ->searchable()
+                    ->live()
+                    ->afterStateUpdated(function (callable $set) {
+                        $set('ticket_status_id', null);
+                        $set('assignees', []);
+                        $set('epic_id', null);
+                    })
+                    ->columnSpanFull(),
+
+                Select::make('ticket_status_id')
+                    ->label('Status')
+                    ->options(function (callable $get) {
+                        $projectId = $get('project_id');
+                        if (! $projectId) {
+                            return [];
+                        }
+
+                        return TicketStatus::where('project_id', $projectId)
+                            ->pluck('name', 'id')
+                            ->toArray();
+                    })
+                    ->required()
+                    ->searchable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id')),
+
+                Select::make('priority_id')
+                    ->label('Priority')
+                    ->options(TicketPriority::pluck('name', 'id')->toArray())
+                    ->searchable()
+                    ->nullable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id')),
+
+                Select::make('epic_id')
+                    ->label('Epic')
+                    ->options(function (callable $get) {
+                        $projectId = $get('project_id');
+                        if (! $projectId) {
+                            return [];
+                        }
+
+                        return Epic::where('project_id', $projectId)
+                            ->pluck('name', 'id')
+                            ->toArray();
+                    })
+                    ->searchable()
+                    ->nullable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id')),
+
+                TextInput::make('name')
+                    ->label('Ticket Name')
+                    ->required()
+                    ->maxLength(255)
+                    ->hidden(fn (callable $get): bool => ! $get('project_id'))
+                    ->columnSpanFull(),
+
+                Select::make('assignees')
+                    ->label('Assigned to')
+                    ->multiple()
+                    ->options(function (callable $get) {
+                        $projectId = $get('project_id');
+                        if (! $projectId) {
+                            return [];
+                        }
+
+                        $project = Project::find($projectId);
+                        if (! $project) {
+                            return [];
+                        }
+
+                        return $project->members()
+                            ->orderBy('name')
+                            ->pluck('name', 'users.id')
+                            ->toArray();
+                    })
+                    ->searchable()
+                    ->live()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id'))
+                    ->helperText('Only project members can be assigned.'),
+
+                DatePicker::make('start_date')
+                    ->label('Start Date')
+                    ->default(now())
+                    ->nullable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id')),
+
+                DatePicker::make('due_date')
+                    ->label('Due Date')
+                    ->nullable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id')),
+
+                RichEditor::make('description')
+                    ->label('Description')
+                    ->fileAttachmentsDisk('public')
+                    ->fileAttachmentsDirectory('attachments')
+                    ->fileAttachmentsVisibility('public')
+                    ->nullable()
+                    ->hidden(fn (callable $get): bool => ! $get('project_id'))
+                    ->columnSpanFull(),
+            ]);
     }
 }
