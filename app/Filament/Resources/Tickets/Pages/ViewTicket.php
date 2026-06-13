@@ -6,6 +6,7 @@ use App\Filament\Pages\ProjectBoard;
 use App\Filament\Resources\Tickets\TicketResource;
 use App\Models\Ticket;
 use App\Models\TicketComment;
+use App\Models\TicketStatus;
 use Filament\Actions\Action;
 use Filament\Actions\EditAction;
 use Filament\Forms\Components\Hidden;
@@ -16,7 +17,6 @@ use Filament\Resources\Pages\ViewRecord;
 use Filament\Schemas\Components\Grid;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
-use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
 
 class ViewTicket extends ViewRecord
@@ -24,6 +24,59 @@ class ViewTicket extends ViewRecord
     protected static string $resource = TicketResource::class;
 
     public ?int $editingCommentId = null;
+
+    public function canChangeStatus(): bool
+    {
+        $ticket = $this->getRecord();
+
+        return auth()->user()->hasRole(['super_admin'])
+            || $ticket->created_by === auth()->id()
+            || $ticket->assignees()->where('users.id', auth()->id())->exists();
+    }
+
+    public function updateStatus(int $statusId): void
+    {
+        $ticket = $this->getRecord();
+
+        if (! $this->canChangeStatus()) {
+            Notification::make()
+                ->title('You do not have permission to change this ticket status')
+                ->danger()
+                ->send();
+
+            return;
+        }
+
+        if ($ticket->ticket_status_id === $statusId) {
+            return;
+        }
+
+        $targetStatus = TicketStatus::query()
+            ->where('project_id', $ticket->project_id)
+            ->whereKey($statusId)
+            ->first();
+
+        if (! $targetStatus) {
+            Notification::make()
+                ->title('Status Not Found')
+                ->body("This ticket's project does not have that status.")
+                ->warning()
+                ->send();
+
+            return;
+        }
+
+        $ticket->update([
+            'ticket_status_id' => $targetStatus->id,
+        ]);
+
+        $ticket->load('status');
+
+        Notification::make()
+            ->title('Status changed to '.$targetStatus->name)
+            ->success()
+            ->send();
+    }
 
     public function editCommentAction(): Action
     {
@@ -256,16 +309,8 @@ class ViewTicket extends ViewRecord
                             ->schema([
                                 TextEntry::make('status.name')
                                     ->label('Status')
-                                    ->formatStateUsing(function ($record) {
-                                        $color = e($record->status?->color ?? '#6B7280');
-                                        $name = e($record->status?->name ?? 'Unknown');
-
-                                        return new HtmlString(<<<HTML
-                                        <span class="fi-badge fi-size-sm" style="color: #fff; background-color: {$color};">
-                                            {$name}
-                                        </span>
-                                    HTML);
-                                    }),
+                                    ->hiddenLabel()
+                                    ->view('filament.resources.ticket-resource.status-switcher'),
 
                                 TextEntry::make('assignees.name')
                                     ->label('Assigned To')
